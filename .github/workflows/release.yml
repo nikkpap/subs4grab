@@ -1,0 +1,26 @@
+# Push a tag like v1.2.0  ->  this creates the GitHub Release with Subs4Grab.pyw attached.
+# The app's OTA updater picks it up automatically.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that APP_VERSION matches the tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(grep -m1 -oP '^APP_VERSION = "\K[^"]+' Subs4Grab.pyw)
+          echo "tag=$TAG  app=$VER"
+          if [ "$TAG" != "$VER" ]; then echo "::error::APP_VERSION ($VER) does not match tag ($TAG)"; exit 1; fi
+      - name: Syntax check
+        run: python3 -c "import ast; ast.parse(open('Subs4Grab.pyw', encoding='utf-8').read())"
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Subs4Grab.pyw
+          generate_release_notes: true
