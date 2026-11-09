@@ -5,11 +5,21 @@ Automatic Greek & English subtitles for your videos — **ALU DEV TEAM**
 Drag your videos (or whole folders) in, press **START**, and every video gets its subtitle saved next to it with the same name, so your TV, VLC and Kodi load it automatically.
 
 ## Sources
-| Source | Used for | How it matches |
-|---|---|---|
-| [subs4series.com](https://www.subs4series.com) | TV series | name, season/episode, release group + downloads |
-| [subs4free.club](https://www.subs4free.club) / subs4free.info | Movies | name, year, release + downloads |
-| [OpenSubtitles.com](https://www.opensubtitles.com) *(optional)* | Everything | **file hash** (exact file) + name |
+Choose **🤖 Auto** (every source that works) or **✋ Let me choose** from the *Sources* menu.
+
+| Source | Series | Movies | Setup |
+|---|:-:|:-:|---|
+| [subs4series.com](https://www.subs4series.com) | ✔ | | none |
+| [subs4free.club](https://www.subs4free.club) / .info | | ✔ | none |
+| [Podnapisi.net](https://www.podnapisi.net) | ✔ | ✔ | none |
+| [GreekSubs.net](https://greeksubs.net) | ✔ | ✔ | none |
+| [Greek-Subtitles.com](http://gr.greek-subtitles.com) | ✔ | ✔ | none |
+| [YIFY Subtitles](https://yifysubtitles.ch) | | ✔ | none |
+| [Gestdown](https://gestdown.info) (Addic7ed) | ✔ | | none |
+| [OpenSubtitles.com](https://www.opensubtitles.com) | ✔ | ✔ | free API key (exact match by **file hash**) |
+| [SubDL.com](https://subdl.com) | ✔ | ✔ | free API key |
+
+The best subtitle from all sources wins: exact file match (hash) first, then your release (group / source / resolution), then most downloads.
 
 ## Install
 1. Install [Python 3.10+](https://www.python.org/downloads/) (tick *Add Python to PATH*).

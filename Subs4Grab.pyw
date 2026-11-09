@@ -34,7 +34,7 @@ All dependencies are installed automatically on first start.
 """
 
 APP_NAME = "Subs4Grab"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 GITHUB_REPO = "nikkpap/subs4grab"          # OTA updates come from this repo's Releases
 
 # =============================================================================
@@ -252,6 +252,9 @@ DEFAULT_SETTINGS = {
     "os_token_time": 0,
     "os_base": "",
     "auto_update": True,
+    "sources_mode": "auto",       # "auto" = every source that works, "custom" = my choice
+    "sources": {},                # source id -> True/False (custom mode)
+    "subdl_key": "",
     "skip_version": "",
     "last_dir": str(Path.home()),
 }
@@ -468,7 +471,9 @@ class Candidate:
 
     @property
     def source_site(self):
-        name = urlparse(self.base or self.link).netloc.replace("www.", "")
+        name = SOURCE_NAMES.get(self.site) or urlparse(self.base or self.link).netloc.replace("www.", "")
+        if self.site in ("series", "movies"):
+            name = urlparse(self.base or self.link).netloc.replace("www.", "")
         if self.hash_match:
             name += "  ✓ exact (hash)"
         if self.ai:
@@ -1039,7 +1044,7 @@ class OpenSubtitles:
 
     # ----- helpers -----
     def usable(self):
-        return bool(self.settings.get("os_enabled") and self.settings.get("os_api_key")) and not self.off_reason
+        return bool(self.settings.get("os_api_key")) and not self.off_reason
 
     def _headers(self, auth=False):
         h = {"Api-Key": self.settings.get("os_api_key", "").strip(),
@@ -1250,6 +1255,397 @@ def install_vlsub():
 
 
 # =============================================================================
+#  6b2. MORE SOURCES (Podnapisi, GreekSubs, Greek-Subtitles, YIFY, Gestdown, SubDL)
+# =============================================================================
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+
+# id, display name, series?, movies?, needs setup (key), short description
+SOURCES = [
+    ("subs4series", "subs4series.com", True, False, None, "Greek series site"),
+    ("subs4free", "subs4free.club / .info", False, True, None, "Greek movies site"),
+    ("podnapisi", "Podnapisi.net", True, True, None, "big international database, official API"),
+    ("greeksubs", "GreekSubs.net", True, True, None, "Greek site (finds the title by IMDb)"),
+    ("greeksubtitles", "Greek-Subtitles.com", True, True, None, "Greek site"),
+    ("yify", "YIFY Subtitles", False, True, None, "movies, popular releases (by IMDb)"),
+    ("gestdown", "Gestdown (Addic7ed)", True, False, None, "series, Addic7ed database"),
+    ("opensubtitles", "OpenSubtitles.com", True, True, "os", "exact match by file hash – free key"),
+    ("subdl", "SubDL.com", True, True, "subdl", "large database – free key"),
+]
+SOURCE_NAMES = {sid: name for sid, name, *_ in SOURCES}
+
+
+def source_ready(sid, settings):
+    need = next((n for i, _, _, _, n, _ in SOURCES if i == sid), None)
+    if need == "os":
+        return bool(settings.get("os_api_key"))
+    if need == "subdl":
+        return bool(settings.get("subdl_key"))
+    return True
+
+
+def active_sources(settings, kind=None):
+    out = []
+    for sid, name, ser, mov, need, _ in SOURCES:
+        if kind == "episode" and not ser:
+            continue
+        if kind == "movie" and not mov:
+            continue
+        if not source_ready(sid, settings):
+            continue
+        if settings.get("sources_mode", "auto") == "custom":
+            default = sid != "opensubtitles" or bool(settings.get("os_enabled"))
+            if not settings.get("sources", {}).get(sid, default):
+                continue
+        out.append(sid)
+    return out
+
+
+_imdb_cache = {}
+
+
+def imdb_lookup(title, year, kind):
+    """Free IMDb suggestion service (no key). Returns 'tt1234567' or None."""
+    key = (sanitize(title), year, kind)
+    if key in _imdb_cache:
+        return _imdb_cache[key]
+    q = sanitize(title)
+    if not q:
+        return None
+    try:
+        r = requests.get(f"https://v2.sg.media-imdb.com/suggestion/{q[0]}/{quote_plus(q)}.json",
+                         headers={"User-Agent": BROWSER_UA}, timeout=15)
+        items = r.json().get("d", []) if r.status_code == 200 else []
+    except Exception:
+        items = []
+    want = ("tvSeries", "tvMiniSeries") if kind == "episode" else ("movie", "tvMovie", "video")
+    best = None
+    for it in items:
+        iid = it.get("id", "")
+        if not iid.startswith("tt") or (it.get("qid") or "") not in want:
+            continue
+        r_ = difflib.SequenceMatcher(None, q, sanitize(it.get("l", ""))).ratio()
+        y = it.get("y")
+        if year and y:
+            if kind != "episode" and abs(int(y) - year) > 1:
+                continue
+            if int(y) == year:
+                r_ += 0.15
+        if r_ >= 0.6 and (best is None or r_ > best[0]):
+            best = (r_, iid)
+    _imdb_cache[key] = best[1] if best else None
+    return _imdb_cache[key]
+
+
+class BaseSource:
+    sid = ""
+
+    def __init__(self, settings, log):
+        self.settings, self.log = settings, log
+        self.s = requests.Session()
+        self.s.headers.update({"User-Agent": BROWSER_UA, "Accept-Language": ACCEPT_LANG})
+        self._last = 0.0
+
+    def wait(self, gap=0.5):
+        w = gap - (time.time() - self._last)
+        if w > 0:
+            time.sleep(w)
+        self._last = time.time()
+
+    def get(self, url, **kw):
+        self.wait()
+        kw.setdefault("timeout", 25)
+        return self.s.get(url, **kw)
+
+    def cand(self, lang, version, link, page, downloads=0, uploader="", **extra):
+        base = "https://" + urlparse(page or link).netloc
+        return Candidate(self.sid, lang, version, uploader, link, page, int(downloads or 0), base=base, **extra)
+
+
+def lang_code(text):
+    t = (text or "").strip().lower()
+    if t in ("el", "ell", "gre", "gr", "greek", "ελληνικά", "ελληνικα") or t.startswith("greek"):
+        return "el"
+    if t in ("en", "eng", "english", "uk", "gb", "us") or t.startswith("english"):
+        return "en"
+    return t[:2] if t else "?"
+
+
+class PodnapisiSource(BaseSource):
+    sid = "podnapisi"
+    URL = "https://www.podnapisi.net/subtitles"
+
+    def search(self, item, langs):
+        out, seen = [], set()
+        for lang in langs:
+            params = {"keywords": item.title, "language": lang}
+            if item.kind == "episode":
+                params.update(seasons=item.season or 1, episodes=item.episode,
+                              movie_type=["tv-series", "mini-series"])
+            else:
+                params["movie_type"] = "movie"
+                if item.year:
+                    params["year"] = item.year
+            for page in (1, 2):
+                params["page"] = page
+                r = self.get(self.URL + "/search/advanced", params=params, headers={"Accept": "application/json"})
+                if r.status_code != 200:
+                    break
+                j = r.json()
+                for d in j.get("data", []):
+                    mv = d.get("movie") or {}
+                    if item.kind == "episode" and mv.get("type") == "movie":
+                        continue
+                    if d.get("id") in seen:
+                        continue
+                    seen.add(d.get("id"))
+                    rel = (d.get("releases") or []) + (d.get("custom_releases") or [])
+                    version = rel[0] if rel else f"{mv.get('title', '')} {mv.get('year', '')}"
+                    dl = (d.get("stats") or {}).get("downloads") or d.get("downloads") or 0
+                    out.append(self.cand(lang_code(d.get("language")), version,
+                                         f"{self.URL}/{d.get('id')}/download?container=zip",
+                                         urljoin("https://www.podnapisi.net", d.get("url") or ""), dl))
+                if int(j.get("page") or 1) >= int(j.get("all_pages") or 1):
+                    break
+        return out
+
+    def download(self, cand):
+        r = self.get(cand.link, headers={"Referer": cand.page})
+        return ("podnapisi.zip", r.content) if r.status_code == 200 else (None, None)
+
+
+class GreekSubsSource(BaseSource):
+    sid = "greeksubs"
+    URL = "https://greeksubs.net/"
+
+    def _rows(self, html, page_url):
+        soup = BeautifulSoup(html, "html.parser")
+        sec = soup.find("input", {"id": "secCode"})
+        if not sec or not sec.get("value"):
+            return []
+        out = []
+        for tr in soup.select("#elSub > tbody > tr"):
+            try:
+                btn = tr.find("button", {"onclick": re.compile(r"^downloadMe")})
+                sub_id = re.search(r"downloadMe\('([^']+)'\)", btn.get("onclick")).group(1)
+                img = tr.find("img", {"src": re.compile(r"/resources/lang/")})
+                td = btn.find_parent("td")
+                version = td.find_next_sibling("td").find_next_sibling("td").get_text(strip=True)
+                up = tr.find(class_="userNameBox")
+                c = self.cand(lang_code(img.get("alt") if img else ""), version,
+                              f"{self.URL}dll/{sub_id}/0/{sec.get('value')}", page_url, 0,
+                              up.get_text(strip=True) if up else "", file_name=sub_id)
+                out.append(c)
+            except Exception:
+                continue
+        return out
+
+    def search(self, item, langs):
+        imdb = imdb_lookup(item.title, item.year, item.kind)
+        if not imdb:
+            return []
+        url = f"{self.URL}en/view/{imdb}"
+        r = self.get(url)
+        if r.status_code != 200:
+            return []
+        html = r.content.decode("utf-8", "ignore")
+        if item.kind != "episode":
+            return [c for c in self._rows(html, url) if c.lang in langs]
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.select("div.col-lg-offset-2.col-md-8.text-center.top30.bottom10 > a, a[href]"):
+            m = re.search(r"Season (\d+) Episode (\d+)", a.get_text(" ", strip=True))
+            if m and int(m.group(1)) == (item.season or 1) and int(m.group(2)) == item.episode:
+                ep = urljoin(url, a["href"])
+                r2 = self.get(ep)
+                return [c for c in self._rows(r2.content.decode("utf-8", "ignore"), ep) if c.lang in langs]
+        return []
+
+    def download(self, cand):
+        r = self.get(cand.link, headers={"Referer": cand.page}, allow_redirects=False)
+        if r.status_code == 302:                       # single-use token expired -> refresh
+            r0 = self.get(cand.page)
+            sec = BeautifulSoup(r0.content.decode("utf-8", "ignore"), "html.parser").find("input", {"id": "secCode"})
+            if not sec:
+                return None, None
+            cand.link = f"{self.URL}dll/{cand.file_name}/0/{sec.get('value')}"
+            r = self.get(cand.link, headers={"Referer": cand.page}, allow_redirects=False)
+        ct = r.headers.get("Content-Type", "").lower()
+        cd = r.headers.get("Content-Disposition", "").lower()
+        if r.content and ("attachment" in cd or (ct and not ct.startswith("text/html"))):
+            return "greeksubs.srt", r.content
+        soup = BeautifulSoup(r.content.decode("utf-8", "ignore"), "html.parser")
+        try:
+            data = {k: soup.find(attrs={"name": k}).get("value") for k in ("langcode", "uid", "output", "dll")}
+        except Exception:
+            return None, None
+        self.wait()
+        r2 = self.s.post(cand.link, data=data, headers={"Referer": cand.link}, timeout=25)
+        return ("greeksubs.srt", r2.content) if r2.content else (None, None)
+
+
+class GreekSubtitlesSource(BaseSource):
+    sid = "greeksubtitles"
+    URL = "http://gr.greek-subtitles.com/"
+    DL = "http://www.greeksubtitles.info/getp.php?id={}"
+
+    def search(self, item, langs):
+        q = item.title
+        if item.kind == "episode":
+            q += f" S{(item.season or 1):02d}E{item.episode:02d}"
+        elif item.year:
+            q += f" {item.year}"
+        url = self.URL + "search.php?name=" + quote_plus(q)
+        out = []
+        for _ in range(3):                                  # max 3 result pages
+            r = self.get(url)
+            if r.status_code != 200 or not r.content:
+                break
+            soup = BeautifulSoup(r.content.decode("utf-8", "ignore"), "html.parser")
+            for a in soup.select("td.latest_name > a:nth-of-type(1)"):
+                try:
+                    sub_id = int(a["href"].rsplit("/", 2)[1])
+                except Exception:
+                    continue
+                img = a.parent.find("img")
+                lang = lang_code(img["src"].split("/")[-1].split(".")[0]) if img else "?"
+                if lang in langs or lang == "?":
+                    out.append(self.cand(lang, a.get_text(strip=True), self.DL.format(sub_id),
+                                         urljoin(self.URL, a["href"]), parse_downloads(a.find_parent("tr") or a)))
+            nxt = next((x for x in soup.select("td a") if "Next" in x.get_text() and "search.php" in x.get("href", "")), None)
+            if not nxt:
+                break
+            url = urljoin(self.URL, nxt["href"])
+        return out
+
+    def download(self, cand):
+        r = self.get(cand.link, headers={"Referer": cand.page})
+        return ("greeksubtitles.zip", r.content) if r.status_code == 200 else (None, None)
+
+
+class YifySource(BaseSource):
+    sid = "yify"
+    URL = "https://yifysubtitles.ch"
+
+    def search(self, item, langs):
+        if item.kind == "episode":
+            return []
+        imdb = imdb_lookup(item.title, item.year, "movie")
+        if not imdb:
+            return []
+        r = self.get(f"{self.URL}/movie-imdb/{imdb}", allow_redirects=False, headers={"Referer": self.URL})
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.content, "html.parser")
+        tbl = soup.find("table", {"class": "other-subs"})
+        out = []
+        for tr in (tbl.find("tbody").find_all("tr") if tbl and tbl.find("tbody") else []):
+            td = tr.find_all("td")
+            try:
+                lang = lang_code(td[1].get_text(strip=True))
+                if lang not in langs:
+                    continue
+                a = td[2].find("a")
+                rel = re.sub(r"^\s*subtitle\s+", "", td[2].get_text(" ", strip=True))
+                rating = int(re.sub(r"\D", "", td[0].get_text()) or 0)
+                out.append(self.cand(lang, rel, urljoin(self.URL, a["href"]), urljoin(self.URL, a["href"]),
+                                     rating * 50, td[4].get_text(strip=True) if len(td) > 4 else ""))
+            except Exception:
+                continue
+        return out
+
+    def download(self, cand):
+        r = self.get(cand.link, headers={"Referer": cand.page})
+        a = BeautifulSoup(r.content, "html.parser").find("a", {"class": "download-subtitle"})
+        if not a:
+            return None, None
+        r2 = self.get(urljoin(self.URL, a["href"]), headers={"Referer": cand.link})
+        return ("yify.zip", r2.content) if r2.status_code == 200 else (None, None)
+
+
+class GestdownSource(BaseSource):
+    sid = "gestdown"
+    URL = "https://api.gestdown.info"
+    LANG = {"el": "Greek", "en": "English"}
+
+    def search(self, item, langs):
+        if item.kind != "episode":
+            return []
+        r = self.get(f"{self.URL}/shows/search/{quote_plus(item.title)}")
+        if r.status_code != 200:
+            return []
+        shows = r.json().get("shows") or []
+        shows = [x for x in shows
+                 if difflib.SequenceMatcher(None, sanitize(item.title), sanitize(x.get("name", ""))).ratio() >= 0.7]
+        out = []
+        for show in shows[:2]:
+            for lang in langs:
+                if lang not in self.LANG:
+                    continue
+                r = self.get(f"{self.URL}/subtitles/get/{show['id']}/{item.season or 1}/{item.episode}/{self.LANG[lang]}")
+                if r.status_code != 200:
+                    continue
+                for d in r.json().get("matchingSubtitles") or []:
+                    if not d.get("completed", True):
+                        continue
+                    out.append(self.cand(lang, d.get("version", ""), self.URL + d.get("downloadUri", ""),
+                                         self.URL + d.get("downloadUri", ""), d.get("downloadCount") or 0))
+        return out
+
+    def download(self, cand):
+        r = self.get(cand.link, allow_redirects=True)
+        return ("gestdown.srt", r.content) if r.status_code == 200 else (None, None)
+
+
+class SubdlSource(BaseSource):
+    sid = "subdl"
+    URL = "https://api.subdl.com/api/v1/subtitles"
+
+    def search(self, item, langs):
+        key = self.settings.get("subdl_key", "").strip()
+        if not key:
+            return []
+        params = {"api_key": key, "languages": ",".join(l.upper() for l in langs),
+                  "subs_per_page": 30, "releases": 1}
+        imdb = imdb_lookup(item.title, item.year, item.kind)
+        if imdb:
+            params["imdb_id"] = imdb
+        else:
+            params["film_name"] = item.title
+        if item.kind == "episode":
+            params.update(type="tv", season_number=item.season or 1, episode_number=item.episode)
+        else:
+            params["type"] = "movie"
+            if item.year and not imdb:
+                params["year"] = item.year
+        r = self.get(self.URL, params=params)
+        j = r.json() if r.status_code == 200 else {}
+        if not j.get("status", True) and j.get("error"):
+            self.log(f"   SubDL: {j.get('error')}")
+        out = []
+        for d in j.get("subtitles") or []:
+            if d.get("ai_translated"):
+                continue
+            lang = lang_code(d.get("language") or d.get("lang"))
+            if lang not in langs:
+                continue
+            if item.kind == "episode" and d.get("episode") not in (None, item.episode) and not d.get("full_season"):
+                continue
+            out.append(self.cand(lang, d.get("release_name") or d.get("name") or "",
+                                 urljoin("https://dl.subdl.com", d.get("url") or ""),
+                                 "https://subdl.com" + (d.get("subtitlePage") or ""),
+                                 d.get("download_count") or 0, d.get("author") or ""))
+        return out
+
+    def download(self, cand):
+        r = self.get(cand.link)
+        return ("subdl.zip", r.content) if r.status_code == 200 else (None, None)
+
+
+EXTRA_SOURCES = {c.sid: c for c in (PodnapisiSource, GreekSubsSource, GreekSubtitlesSource,
+                                    YifySource, GestdownSource, SubdlSource)}
+
+
+# =============================================================================
 #  6c. OTA UPDATES  (GitHub Releases of nikkpap/subs4grab)
 # =============================================================================
 #  Publishing an update = create a Release with tag  vX.Y.Z  and attach
@@ -1403,6 +1799,7 @@ class Engine:
         self._page_cache = {}
         self._last = 0.0
         self.os = OpenSubtitles(settings, log)
+        self.extra = {sid: cls(settings, log) for sid, cls in EXTRA_SOURCES.items()}
         self.reasons = []      # why the last lookup failed (shown in the Status column)
         self._dl_debug_saved = set()
 
@@ -1575,26 +1972,39 @@ class Engine:
         return out
 
     def list_candidates(self, item: VideoItem, langs=("el", "en")):
-        """Greek sites + (optional) OpenSubtitles.com, merged."""
+        """Search every active source and merge the results."""
         self.reasons = []
-        try:
-            cands, name = self.site_candidates(item)
-        except Exception as e:
-            self.log(f"   site error: {e.__class__.__name__}: {e}")
-            cands, name = [], ""
-        if self.os.usable():
+        langs = list(langs)
+        active = active_sources(self.settings, item.kind)
+        self.log(f"   sources: {', '.join(SOURCE_NAMES[x] for x in active) or 'none!'}")
+        cands, name = [], ""
+        for sid in active:
+            host = SOURCE_NAMES[sid]
             try:
-                oc, oname = self.os.search(item, langs)
-                hm = sum(1 for c in oc if c.hash_match)
-                self.log(f"   opensubtitles.com: {len(oc)} subtitle(s)" +
-                         (f", {hm} exact for this file (hash) ✓" if hm else ""))
-                cands += oc
-                name = name or oname
+                if sid in ("subs4series", "subs4free"):
+                    found, nm = self.site_candidates(item)
+                elif sid == "opensubtitles":
+                    found, nm = self.os.search(item, langs)
+                    if self.os.off_reason:
+                        self.reasons.append(self.os.off_reason)
+                else:
+                    found, nm = self.extra[sid].search(item, langs), ""
             except Exception as e:
-                self.log(f"   opensubtitles.com error: {e.__class__.__name__}: {e}")
-                self.reasons.append("opensubtitles.com: error")
-            if self.os.off_reason:
-                self.reasons.append(self.os.off_reason)
+                self.log(f"   {host}: error ({e.__class__.__name__}: {str(e)[:80]})")
+                self.reasons.append(f"{host}: error")
+                continue
+            hm = sum(1 for c in found if c.hash_match)
+            if sid not in ("subs4series", "subs4free"):
+                self.log(f"   {host}: {len(found)} subtitle(s)" + (f", {hm} exact (hash) ✓" if hm else ""))
+            cands += found
+            name = name or nm
+        seen, uniq = set(), []
+        for c in cands:
+            if c.link not in seen:
+                seen.add(c.link); uniq.append(c)
+        cands = uniq
+        if not cands and not self.reasons:
+            self.reasons.append(f"not found in {len(active)} source(s)")
         return cands, name
 
     def site_candidates(self, item: VideoItem):
@@ -1856,6 +2266,22 @@ class Engine:
         return None
 
     def download_and_save(self, item: VideoItem, cand: Candidate, allow_manual=True):
+        if cand.site in self.extra:
+            try:
+                fname, data = self.extra[cand.site].download(cand)
+            except Exception as e:
+                self.log(f"   {SOURCE_NAMES[cand.site]} download error: {e.__class__.__name__}")
+                return None
+            if not data or not looks_like_payload(data):
+                return None
+            members = archive_members(data)
+            if members is None:
+                return None
+            if data[:2] not in (b"PK", b"Ra", b"7z"):
+                ext = Path(fname or "").suffix.lower()
+                members = {(fname if ext in SUB_TEXT_EXT else "subtitle.srt"): data}
+            name, raw = pick_member(members, item)
+            return save_subtitle(item, name, raw, cand.lang, self.settings) if raw else None
         if cand.site == "opensubtitles":
             fname, data = self.os.download(cand)
             if not data or not looks_like_payload(data):
@@ -2127,6 +2553,85 @@ class CandidateDialog(QDialog):
         return self.cands[r] if 0 <= r < len(self.cands) else None
 
 
+class SourcesDialog(QDialog):
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.main = parent
+        self.setWindowTitle("Subtitle sources")
+        self.setMinimumWidth(720)
+        L = QVBoxLayout(self); L.setSpacing(10)
+        L.addWidget(QLabel("<b style='font-size:13pt'>Where should I look for subtitles?</b>"))
+        self.cb_mode = QComboBox()
+        self.cb_mode.addItem("🤖  Auto – use every source that works (recommended)", "auto")
+        self.cb_mode.addItem("✋  Let me choose the sources", "custom")
+        self.cb_mode.setCurrentIndex(0 if settings.get("sources_mode", "auto") == "auto" else 1)
+        self.cb_mode.currentIndexChanged.connect(self._refresh)
+        L.addWidget(self.cb_mode)
+        grid = QGridLayout(); grid.setHorizontalSpacing(12); grid.setVerticalSpacing(6)
+        for c, h in enumerate(["Use", "Source", "Series", "Movies", "", ""]):
+            lab = QLabel(f"<b>{h}</b>"); grid.addWidget(lab, 0, c)
+        self.checks, self.status = {}, {}
+        for r, (sid, name, ser, mov, need, desc) in enumerate(SOURCES, start=1):
+            ck = QCheckBox()
+            default = sid != "opensubtitles" or bool(settings.get("os_enabled"))
+            ck.setChecked(settings.get("sources", {}).get(sid, default))
+            self.checks[sid] = ck
+            nm = QLabel(f"{name}<br><span style='color:#8f98bd; font-size:9pt'>{desc}</span>")
+            st = QLabel(""); self.status[sid] = st
+            grid.addWidget(ck, r, 0); grid.addWidget(nm, r, 1)
+            grid.addWidget(QLabel("✔" if ser else "–"), r, 2); grid.addWidget(QLabel("✔" if mov else "–"), r, 3)
+            grid.addWidget(st, r, 4)
+            if need:
+                b = QPushButton("⚙ Setup"); b.setStyleSheet("padding:4px 10px;")
+                b.clicked.connect(lambda _=False, n=need: self._setup(n))
+                grid.addWidget(b, r, 5)
+        box = QFrame(); box.setObjectName("card"); box.setLayout(grid)
+        L.addWidget(box)
+        tip = QLabel("Every source is searched and the best subtitle from all of them is chosen "
+                     "(exact file match first, then your release, then most downloads).")
+        tip.setWordWrap(True); tip.setObjectName("muted"); L.addWidget(tip)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        L.addWidget(bb)
+        self._refresh()
+
+    def _refresh(self):
+        auto = self.cb_mode.currentData() == "auto"
+        for sid, ck in self.checks.items():
+            ready = source_ready(sid, self.settings)
+            ck.setEnabled(not auto and ready)
+            if auto:
+                ck.setChecked(ready)
+            self.status[sid].setText("" if ready else "<span style='color:#fbbf24'>needs free key</span>")
+
+    def _setup(self, need):
+        if need == "os":
+            OpenSubtitlesDialog(self.settings, self).exec()
+        else:
+            from PyQt6.QtWidgets import QInputDialog
+            QDesktopServices.openUrl(QUrl("https://subdl.com/panel/api"))
+            key, ok = QInputDialog.getText(
+                self, "SubDL – free API key",
+                "1. A page opened: sign up / log in on subdl.com\n"
+                "2. Copy your API key from that page\n3. Paste it here:",
+                text=self.settings.get("subdl_key", ""))
+            if ok:
+                self.settings["subdl_key"] = key.strip()
+                save_json(SETTINGS_FILE, self.settings)
+        if self.main is not None:
+            self.main.engine.os = OpenSubtitles(self.settings, self.main._log_threadsafe)
+        self._refresh()
+
+    def accept(self):
+        self.settings["sources_mode"] = self.cb_mode.currentData()
+        if self.settings["sources_mode"] == "custom":
+            self.settings["sources"] = {sid: ck.isChecked() for sid, ck in self.checks.items()}
+            self.settings["os_enabled"] = self.checks["opensubtitles"].isChecked()
+        save_json(SETTINGS_FILE, self.settings)
+        super().accept()
+
+
 class OpenSubtitlesDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -2271,7 +2776,7 @@ class MainWindow(QMainWindow):
         ic = QLabel(); ic.setPixmap(make_icon().pixmap(46, 46))
         tt = QVBoxLayout(); tt.setSpacing(0)
         t1 = QLabel(APP_NAME); t1.setObjectName("title")
-        t2 = QLabel("Greek & English subtitles, automatically.  Series → subs4series.com  ·  Movies → subs4free.club + subs4free.info")
+        t2 = QLabel("Greek & English subtitles, automatically – from 9 sources (subs4series, subs4free, Podnapisi, GreekSubs, OpenSubtitles…)")
         t2.setObjectName("muted")
         tt.addWidget(t1); tt.addWidget(t2)
         hdr.addWidget(ic); hdr.addSpacing(8); hdr.addLayout(tt); hdr.addStretch(1)
@@ -2335,14 +2840,19 @@ class MainWindow(QMainWindow):
                       (self.ck_utf8, "utf8"), (self.ck_manual, "allow_manual")):
             ck.setChecked(bool(self.settings.get(k)))
             v2.addWidget(ck)
-        osrow = QHBoxLayout()
-        self.ck_os = QCheckBox("Also search OpenSubtitles.com  (exact match by file hash)")
-        self.ck_os.setChecked(bool(self.settings.get("os_enabled") and self.settings.get("os_api_key")))
-        self.ck_os.toggled.connect(self._os_toggled)
-        self.btn_os = QPushButton("⚙ Setup"); self.btn_os.clicked.connect(self.os_setup)
-        self.btn_os.setStyleSheet("padding:4px 10px;")
-        osrow.addWidget(self.ck_os); osrow.addStretch(1); osrow.addWidget(self.btn_os)
-        v2.addLayout(osrow)
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("Sources:"))
+        self.cb_src = QComboBox()
+        self.cb_src.addItem("🤖 Auto – all sources", "auto")
+        self.cb_src.addItem("✋ Let me choose…", "custom")
+        self.cb_src.setCurrentIndex(0 if self.settings.get("sources_mode", "auto") == "auto" else 1)
+        self.cb_src.activated.connect(self._src_mode_changed)
+        self.btn_src = QPushButton("⚙ Sources"); self.btn_src.clicked.connect(self.sources_dialog)
+        self.btn_src.setStyleSheet("padding:4px 10px;")
+        self.lbl_src = QLabel(""); self.lbl_src.setObjectName("muted")
+        srow.addWidget(self.cb_src, 1); srow.addWidget(self.btn_src)
+        v2.addLayout(srow); v2.addWidget(self.lbl_src)
+        self._update_src_label()
         v2.addStretch(1)
 
         c3, v3 = self._card(3, "Press START", "Subtitles are saved next to each video")
@@ -2508,21 +3018,26 @@ class MainWindow(QMainWindow):
         self.close()
         QApplication.instance().quit()
 
-    def os_setup(self):
-        dlg = OpenSubtitlesDialog(self.settings, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.engine.os = OpenSubtitles(self.settings, self._log_threadsafe)
-            if self.settings.get("os_api_key"):
-                self.ck_os.setChecked(True)
-            self._settings_from_ui()
-        elif not self.settings.get("os_api_key"):
-            self.ck_os.setChecked(False)
+    def _update_src_label(self):
+        ser = [SOURCE_NAMES[x] for x in active_sources(self.settings, "episode")]
+        mov = [SOURCE_NAMES[x] for x in active_sources(self.settings, "movie")]
+        n = len(set(ser) | set(mov))
+        self.lbl_src.setText(f"{n} source(s) active  ·  hover for the list")
+        self.lbl_src.setToolTip("Series: " + ", ".join(ser) + "\nMovies: " + ", ".join(mov))
 
-    def _os_toggled(self, on):
-        if on and not self.settings.get("os_api_key"):
-            QTimer.singleShot(0, self.os_setup)
-        if not on:
-            self.engine.os.off_reason = ""
+    def _src_mode_changed(self, idx):
+        self.settings["sources_mode"] = self.cb_src.currentData()
+        save_json(SETTINGS_FILE, self.settings)
+        if self.settings["sources_mode"] == "custom":
+            self.sources_dialog()
+        self._update_src_label()
+
+    def sources_dialog(self):
+        dlg = SourcesDialog(self.settings, self)
+        dlg.exec()
+        self.engine.os = OpenSubtitles(self.settings, self._log_threadsafe)
+        self.cb_src.setCurrentIndex(0 if self.settings.get("sources_mode", "auto") == "auto" else 1)
+        self._update_src_label()
 
     def _help(self):
         QMessageBox.information(self, "How it works", (
@@ -2534,8 +3049,9 @@ class MainWindow(QMainWindow):
             "subs4free.club + subs4free.info (movies, both searched), and picks the subtitle that best fits your release, preferring "
             "the most downloaded ones. The .srt is saved next to the video with the same name, "
             "so your TV / VLC / Kodi loads it automatically.\n\n"
-            "• Optional: tick “Also search OpenSubtitles.com” – it finds the subtitle made for exactly "
-            "your file (by file hash). Free account + free API key, the ⚙ Setup window guides you.\n"
+            "• Sources: “Auto” searches every source (subs4series, subs4free, Podnapisi, GreekSubs, "
+            "Greek-Subtitles, YIFY, Gestdown + OpenSubtitles / SubDL if you add their free key). "
+            "Choose “Let me choose…” to pick them yourself.\n"
             "• Double-click a row to choose another subtitle yourself.\n"
             "• Files already done are remembered (by file hash) and skipped next time.\n"
             "• If the site asks “I'm not a robot”, a window opens – click download there.\n"
@@ -2545,7 +3061,7 @@ class MainWindow(QMainWindow):
         self.settings.update(lang_idx=self.cb_lang.currentIndex(), mode_idx=self.cb_mode.currentIndex(),
                              skip_existing=self.ck_skip.isChecked(), lang_suffix=self.ck_suffix.isChecked(),
                              utf8=self.ck_utf8.isChecked(), allow_manual=self.ck_manual.isChecked(),
-                             os_enabled=self.ck_os.isChecked())
+                             sources_mode=self.cb_src.currentData())
         save_json(SETTINGS_FILE, self.settings)
 
     def _update_count(self):
@@ -2646,7 +3162,7 @@ class MainWindow(QMainWindow):
     def _busy(self, on):
         self.btn_start.setEnabled(not on); self.btn_stop.setEnabled(on)
         for w in (self.cb_lang, self.cb_mode, self.ck_skip, self.ck_suffix, self.ck_utf8, self.ck_manual,
-                  self.ck_os, self.btn_os):
+                  self.cb_src, self.btn_src):
             w.setEnabled(not on)
 
     def start(self):
