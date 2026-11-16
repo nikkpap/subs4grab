@@ -2,6 +2,8 @@
 
 Automatic Greek & English subtitles for your videos — **ALU DEV TEAM**
 
+![Subs4Grab main window](docs/screenshots/main.png)
+
 Drag your videos (or whole folders) in, press **START**, and every video gets its subtitle saved next to it with the same name, so your TV, VLC and Kodi load it automatically.
 
 ## Sources
@@ -21,6 +23,8 @@ Choose **🤖 Auto** (every source that works) or **✋ Let me choose** from the
 
 The best subtitle from all sources wins: exact file match (hash) first, then your release (group / source / resolution), then most downloads.
 
+<p align="center"><img src="docs/screenshots/sources.png" width="560" alt="Sources menu"></p>
+
 ## Install
 1. Install [Python 3.10+](https://www.python.org/downloads/) (tick *Add Python to PATH*).
 2. Download **Subs4Grab.pyw** from the [latest release](../../releases/latest).
@@ -31,7 +35,9 @@ The best subtitle from all sources wins: exact file match (hash) first, then you
 2. **Choose language**: Greek (English if there's none) is the default.
 3. **Press START.**
 
-Double-click any row to choose a different subtitle yourself.
+Double-click any row to choose a different subtitle yourself:
+
+![Choose a subtitle yourself](docs/screenshots/choose.png)
 
 ## Features
 - Anti-bot protection is handled by a built-in browser; if a site asks "I'm not a robot", a small window opens.
@@ -39,7 +45,11 @@ Double-click any row to choose a different subtitle yourself.
 - Files already done are remembered by file hash and skipped next time.
 - OpenSubtitles.com search by file hash (free account + free API key, guided setup).
 - One click installs the official VLSub OpenSubtitles.com extension into VLC.
-- **Automatic updates** from this repository's Releases.
+
+<p align="center"><img src="docs/screenshots/opensubtitles.png" width="480" alt="OpenSubtitles.com setup"></p>
+- **Automatic updates** from this repository's Releases:
+
+![Update bar](docs/screenshots/update.png)
 
 ## Publishing a new version (OTA)
 1. Change `APP_VERSION = "x.y.z"` at the top of `Subs4Grab.pyw` and commit.
@@ -51,3 +61,6 @@ Double-click any row to choose a different subtitle yourself.
 3. GitHub Actions creates the release with `Subs4Grab.pyw` attached. Everyone's app shows **"New version available → Update now"** on its next start.
 
 If you attach a compiled `Subs4Grab.exe` to the release as well, the .exe build updates itself too.
+
+---
+Developed by **Nikolaos K. Paridis (aka nikkpap)** — ALU DEV TEAM

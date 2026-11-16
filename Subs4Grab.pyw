@@ -34,7 +34,7 @@ All dependencies are installed automatically on first start.
 """
 
 APP_NAME = "Subs4Grab"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 GITHUB_REPO = "nikkpap/subs4grab"          # OTA updates come from this repo's Releases
 
 # =============================================================================
@@ -2651,6 +2651,7 @@ class OpenSubtitlesDialog(QDialog):
             "<li>Paste the key below, type your username &amp; password, press <b>③ Test</b>.</li></ol>")
         steps.setWordWrap(True); steps.setTextFormat(Qt.TextFormat.RichText)
         steps.setStyleSheet("background:#171b2e; border:1px solid #262c48; border-radius:10px; padding:8px;")
+        steps.setMinimumHeight(steps.fontMetrics().lineSpacing() * 5 + 30)
         L.addWidget(steps)
         links = QHBoxLayout()
         b1 = QPushButton("① Create free account")
@@ -2666,7 +2667,8 @@ class OpenSubtitlesDialog(QDialog):
         self.e_pass = QLineEdit(unprotect(settings.get("os_pass", "")))
         self.e_pass.setEchoMode(QLineEdit.EchoMode.Password); self.e_pass.setPlaceholderText("password")
         for w in (self.e_key, self.e_user, self.e_pass):
-            w.setStyleSheet("background:#0f1220; border:1px solid #343c62; border-radius:8px; padding:7px;")
+            w.setStyleSheet("background:#0f1220; border:1px solid #343c62; border-radius:8px; padding:2px 8px;")
+            w.setMinimumHeight(w.fontMetrics().height() + 16)
         g.addWidget(QLabel("API key:"), 0, 0); g.addWidget(self.e_key, 0, 1)
         g.addWidget(QLabel("Username:"), 1, 0); g.addWidget(self.e_user, 1, 1)
         g.addWidget(QLabel("Password:"), 2, 0); g.addWidget(self.e_pass, 2, 1)
@@ -2764,7 +2766,8 @@ class MainWindow(QMainWindow):
         b = QLabel(subtitle); b.setObjectName("muted")
         t.addWidget(a); t.addWidget(b)
         h.addWidget(n); h.addSpacing(6); h.addLayout(t); h.addStretch(1)
-        v.addLayout(h)
+        h.setAlignment(Qt.AlignmentFlag.AlignTop)
+        v.addLayout(h, 0)
         return card, v
 
     def _build(self):
@@ -2812,7 +2815,7 @@ class MainWindow(QMainWindow):
         self.drop = DropZone()
         self.drop.dropped.connect(self.add_paths)
         self.drop.clicked.connect(self.pick_files)
-        v1.addWidget(self.drop)
+        v1.addWidget(self.drop, 1)
         b = QHBoxLayout()
         bf = QPushButton("➕ Files"); bf.clicked.connect(self.pick_files)
         bd = QPushButton("📁 Folder"); bd.clicked.connect(self.pick_folder)
@@ -3055,7 +3058,9 @@ class MainWindow(QMainWindow):
             "• Double-click a row to choose another subtitle yourself.\n"
             "• Files already done are remembered (by file hash) and skipped next time.\n"
             "• If the site asks “I'm not a robot”, a window opens – click download there.\n"
-            "• Problems? Click “Show details” and “Open app folder” – the debug pages are saved there."))
+            "• Problems? Click “Show details” and “Open app folder” – the debug pages are saved there.\n\n"
+            f"{APP_NAME} {APP_VERSION}  ·  developed by Nikolaos K. Paridis (aka nikkpap) – ALU DEV TEAM\n"
+            f"github.com/{GITHUB_REPO}"))
 
     def _settings_from_ui(self):
         self.settings.update(lang_idx=self.cb_lang.currentIndex(), mode_idx=self.cb_mode.currentIndex(),
